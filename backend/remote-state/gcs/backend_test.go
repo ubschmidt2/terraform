@@ -156,7 +156,9 @@ func TestBackendWithPrefix(t *testing.T) {
 
 	backend.TestBackendStates(t, be0)
 	backend.TestBackendStateLocks(t, be0, be1)
+	testStaleLocks(t, be0, be1)
 }
+
 func TestBackendWithEncryption(t *testing.T) {
 	t.Parallel()
 
@@ -169,6 +171,7 @@ func TestBackendWithEncryption(t *testing.T) {
 
 	backend.TestBackendStates(t, be0)
 	backend.TestBackendStateLocks(t, be0, be1)
+	testStaleLocks(t, be0, be1)
 }
 
 func testStaleLocks(t *testing.T, b1, b2 backend.Backend) {
