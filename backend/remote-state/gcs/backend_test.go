@@ -203,8 +203,9 @@ func testStaleLocks(t *testing.T, b1, b2 backend.Backend) {
 	infoB.Operation = "test"
 	infoB.Who = "clientB"
 
-	// Reduce tick interval for faster tests
+	// For faster tests, reduce the duration until the lock is considered stale.
 	tickInterval = 5 * time.Second
+	minMissesUntilStale = 4
 
 	lockIDA, err := lockerA.Lock(infoA)
 	if err != nil {
@@ -212,7 +213,7 @@ func testStaleLocks(t *testing.T, b1, b2 backend.Backend) {
 	}
 
 	// stop updating the "updated" timestamp. Eventually, the lock will become stale.
-	lockerA.(*remote.State).Client.(*remoteClient).ticker.Stop()
+	lockerA.(*remote.State).Client.(*remoteClient).stopUpdateCh <- true
 
 	// lock is still held by A after 10 seconds.
 	time.Sleep(10 * time.Second)

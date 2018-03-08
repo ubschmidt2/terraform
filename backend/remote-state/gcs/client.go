@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"runtime/debug"
 	"strconv"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -19,17 +21,26 @@ import (
 // blobs representing state.
 // Implements "state/remote".ClientLocker
 type remoteClient struct {
+	mutex sync.Mutex
+
 	storageContext context.Context
 	storageClient  *storage.Client
 	bucketName     string
 	stateFilePath  string
 	lockFilePath   string
 	encryptionKey  []byte
-	ticker         *time.Ticker
+
+	// The generation number of the lock file created by this remoteClient.
+	generation *int64
+
+	// Channel used for signalling the lock-updating goroutine to stop.
+	stopUpdateCh chan bool
 }
 
-var tickInterval = 1 * time.Minute
-var minMissesUntilStale = 4
+var (
+	tickInterval        = 1 * time.Minute
+	minMissesUntilStale = 15
+)
 
 func (c *remoteClient) Get() (payload *remote.Payload, err error) {
 	stateFileReader, err := c.stateFile().NewReader(c.storageContext)
@@ -116,20 +127,43 @@ func (c *remoteClient) unlockIfStale(lockFile *storage.ObjectHandle) bool {
 
 // updateLockFile periodically updates the "updated" timestamp of the lock
 // file until the lock is released in Unlock().
-func (c *remoteClient) updateLockFile(lockFile *storage.ObjectHandle, generation int64) {
-	for _ = range c.ticker.C {
-		if attrs, err := lockFile.Attrs(c.storageContext); err == nil {
-			if attrs.Generation != generation {
-				// This is no longer the lock file that we started with. Stop updating.
-				c.ticker.Stop()
-				return
-			}
+func (c *remoteClient) updateLockFile() {
+	log.Printf("updateLockFile %q\n", tickInterval)
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
 
-			// Update the "updated" timestamp by removing non-existent metadata.
-			uattrs := storage.ObjectAttrsToUpdate{Metadata: make(map[string]string)}
-			uattrs.Metadata["x-goog-meta-terraform-state-heartbeat"] = ""
-			if _, err := lockFile.Update(c.storageContext, uattrs); err != nil {
-				log.Printf("[WARN] failed to update lock: %s", err)
+	defer func() {
+		c.mutex.Lock()
+		c.stopUpdateCh = nil
+		c.mutex.Unlock()
+	}()
+
+	for {
+		select {
+		case <-c.stopUpdateCh:
+			log.Println("updateLockFile received stop signal")
+			return
+		case t := <-ticker.C:
+			log.Printf("updateLockFile received tick %q\n", t)
+			if attrs, err := c.lockFile().Attrs(c.storageContext); err != nil {
+				log.Printf("[WARN] failed to retrieve the lock file's attributes: %s", err)
+			} else {
+				c.mutex.Lock()
+				generation := *c.generation
+				c.mutex.Unlock()
+
+				if attrs.Generation != generation {
+					// This is no longer the lock file that we started with. Stop updating.
+					log.Printf("[WARN] XXX")
+					return
+				}
+
+				// Update the "updated" timestamp by removing non-existent metadata.
+				uattrs := storage.ObjectAttrsToUpdate{Metadata: make(map[string]string)}
+				uattrs.Metadata["x-goog-meta-terraform-state-heartbeat"] = ""
+				if _, err := c.lockFile().Update(c.storageContext, uattrs); err != nil {
+					log.Printf("[WARN] failed to update lock: %s", err)
+				}
 			}
 		}
 	}
@@ -161,8 +195,13 @@ func (c *remoteClient) Lock(info *state.LockInfo) (string, error) {
 
 	info.ID = strconv.FormatInt(generation, 10)
 
-	c.ticker = time.NewTicker(tickInterval)
-	go c.updateLockFile(lockFile, generation)
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.generation = &generation
+	c.stopUpdateCh = make(chan bool)
+
+	go c.updateLockFile()
 
 	return info.ID, nil
 }
@@ -173,8 +212,16 @@ func (c *remoteClient) Unlock(id string) error {
 		return err
 	}
 
-	if c.ticker != nil {
-		c.ticker.Stop()
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.stopUpdateCh != nil {
+		debug.PrintStack()
+		log.Printf("Unlock sending stop signal %p\n", c)
+		c.stopUpdateCh <- true
+	} else {
+		debug.PrintStack()
+		log.Printf("Unlock called twice?!? %p\n", c)
 	}
 
 	if err := c.lockFile().If(storage.Conditions{GenerationMatch: gen}).Delete(c.storageContext); err != nil {
