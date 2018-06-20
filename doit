@@ -1,1 +1,6 @@
-gmake testacc TEST=./backend/remote-state/gcs GOOGLE_PROJECT=ubschmidt
+#!/bin/bash
+
+set -e
+set -x
+
+make testacc TEST=./backend/remote-state/gcs GOOGLE_PROJECT=google.com:stschmidt
